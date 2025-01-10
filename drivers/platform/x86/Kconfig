@@ -459,39 +459,40 @@ config IBM_RTL
 	 state = 0 (BIOS SMIs on)
 	 state = 1 (BIOS SMIs off)
 
+config LENOVO_WMI
+	tristate
+	depends on ACPI_WMI
+
 config LENOVO_WMI_GAMEZONE
 	tristate "Lenovo GameZone WMI Driver"
 	depends on ACPI_WMI
 	select ACPI_PLATFORM_PROFILE
+	select LENOVO_WMI
 	help
 	  Say Y here if you have a WMI aware Lenovo Legion device and would like to use the
-	  platform-profile firmware interface.
+	  platform-profile firmware interface to manage power usage.
 
 	  To compile this driver as a module, choose M here: the module will
-	  be called lenovo_wmi_gamezone.
+	  be called lenovo-wmi-gamezone.
 
 config LENOVO_WMI_DATA01
-	tristate "Lenovo Legion WMI capability Data 01 Driver"
+	tristate
 	depends on ACPI_WMI
-	help
-	  Say Y here if you have a WMI aware Lenovo Legion device in the "Gaming Series"
-	  line of hardware. This interface is a dependency for exposing tunable power
-	  settings.
-
-	  To compile this driver as a module, choose M here: the module will
-	  be called lenovo_wmi_capdata01.
+	select LENOVO_WMI
 
 config LENOVO_WMI_TUNING
 	tristate "Lenovo Other Method WMI Driver"
-	depends on LENOVO_WMI_DATA01
+	depends on ACPI_WMI
 	select FW_ATTR_CLASS
+	select LENOVO_WMI
+	select LENOVO_WMI_DATA01
 	help
 	  Say Y here if you have a WMI aware Lenovo Legion device and would like to use the
 	  firmware_attributes API to control various tunable settings typically exposed by
 	  Lenovo software in Windows.
 
 	  To compile this driver as a module, choose M here: the module will
-	  be called lenovo_wmi_other.
+	  be called lenovo-wmi-other.
 
 config IDEAPAD_LAPTOP
 	tristate "Lenovo IdeaPad Laptop Extras"

@@ -8,23 +8,27 @@
  * Copyright(C) 2024 Derek J. Clark <derekjohn.clark@gmail.com>
  */
 
+#include <linux/cleanup.h>
+#include <linux/device.h>
+#include <linux/dev_printk.h>
+#include <linux/gfp_types.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/types.h>
+#include <linux/wmi.h>
 #include "lenovo-wmi.h"
 
+/* Interface GUIDs */
 #define LENOVO_CAPABILITY_DATA_01_GUID "7A8F5407-CB67-4D6E-B547-39B3BE018154"
 
-static DEFINE_MUTEX(cd01_call_mutex);
 static DEFINE_MUTEX(cd01_list_mutex);
 static LIST_HEAD(cd01_wmi_list);
-
-static const struct wmi_device_id lenovo_wmi_capdata01_id_table[] = {
-	{ LENOVO_CAPABILITY_DATA_01_GUID, NULL },
-	{}
-};
 
 struct lenovo_wmi_cd01_priv {
 	struct wmi_device *wdev;
 	struct list_head list;
+	int instance_count;
+	struct capdata01 **capdata;
 };
 
 static inline struct lenovo_wmi_cd01_priv *get_first_wmi_priv(void)
@@ -34,61 +38,63 @@ static inline struct lenovo_wmi_cd01_priv *get_first_wmi_priv(void)
 					struct lenovo_wmi_cd01_priv, list);
 }
 
-int lenovo_wmi_capdata01_get(struct lenovo_wmi_attr_id attr_id,
-			     struct capability_data_01 *cap_data)
+struct capdata01 *lenovo_wmi_capdata01_get(u32 attribute_id)
+
 {
-	u32 attribute_id = *(int *)&attr_id;
 	struct lenovo_wmi_cd01_priv *priv;
-	union acpi_object *ret_obj;
-	int instance_idx;
-	int count;
+	int idx;
 
 	priv = get_first_wmi_priv();
 	if (!priv)
-		return -ENODEV;
+		return NULL;
 
-	guard(mutex)(&cd01_call_mutex);
-	count = wmidev_instance_count(priv->wdev);
-	pr_info("Got instance count: %u\n", count);
-
-	for (instance_idx = 0; instance_idx < count; instance_idx++) {
-		ret_obj = wmidev_block_query(priv->wdev, instance_idx);
-		if (!ret_obj) {
-			pr_err("WMI Data block query failed.\n");
+	for (idx = 0; idx < priv->instance_count; idx++) {
+		if (priv->capdata[idx]->id != attribute_id)
 			continue;
-		}
-
-		if (ret_obj->type != ACPI_TYPE_BUFFER) {
-			pr_err("WMI Data block query returned wrong type.\n");
-			kfree(ret_obj);
-			continue;
-		}
-
-		if (ret_obj->buffer.length != sizeof(*cap_data)) {
-			pr_err("WMI Data block query returned wrong buffer length: %u vice expected %lu.\n",
-			       ret_obj->buffer.length, sizeof(*cap_data));
-			kfree(ret_obj);
-			continue;
-		}
-
-		memcpy(cap_data, ret_obj->buffer.pointer,
-		       ret_obj->buffer.length);
-		kfree(ret_obj);
-
-		if (cap_data->id != attribute_id)
-			continue;
-		break;
+		return priv->capdata[idx];
 	}
 
-	if (cap_data->id != attribute_id) {
-		pr_err("Unable to find capability data for attribute_id %x\n",
-		       attribute_id);
-		return -EINVAL;
-	}
-
-	return 0;
+	pr_err("Unable to find capability data for attribute_id %x\n",
+	       attribute_id);
+	return NULL;
 }
 EXPORT_SYMBOL_NS_GPL(lenovo_wmi_capdata01_get, "CAPDATA_WMI");
+
+static int lenovo_wmi_capdata01_setup(struct lenovo_wmi_cd01_priv *priv)
+{
+	size_t cd_size = sizeof(struct capdata01);
+	int count, idx;
+
+	count = wmidev_instance_count(priv->wdev);
+
+	priv->capdata = devm_kmalloc_array(&priv->wdev->dev, (size_t)count,
+					   sizeof(*priv->capdata), GFP_KERNEL);
+	if (!priv->capdata)
+		return -ENOMEM;
+
+	priv->instance_count = count;
+
+	for (idx = 0; idx < count; idx++) {
+		union acpi_object *ret_obj __free(kfree) = NULL;
+		struct capdata01 *cap_ptr =
+			devm_kmalloc(&priv->wdev->dev, cd_size, GFP_KERNEL);
+		ret_obj = wmidev_block_query(priv->wdev, idx);
+		if (!ret_obj)
+			continue;
+
+		if (ret_obj->type != ACPI_TYPE_BUFFER)
+			continue;
+
+		if (ret_obj->buffer.length != cd_size) {
+			continue;
+		}
+
+		memcpy(cap_ptr, ret_obj->buffer.pointer,
+		       ret_obj->buffer.length);
+		priv->capdata[idx] = cap_ptr;
+	}
+	return 0;
+}
 
 static int lenovo_wmi_capdata01_probe(struct wmi_device *wdev,
 				      const void *context)
@@ -96,16 +102,22 @@ static int lenovo_wmi_capdata01_probe(struct wmi_device *wdev,
 {
 	struct lenovo_wmi_cd01_priv *priv;
 
+	pr_info("Probe Start.\n");
 	priv = devm_kzalloc(&wdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 
 	priv->wdev = wdev;
+	pr_info("Allocated Priv.\n");
+
+	dev_set_drvdata(&wdev->dev, priv);
+	pr_info("Set  drvdata.\n");
 
 	guard(mutex)(&cd01_list_mutex);
 	list_add_tail(&priv->list, &cd01_wmi_list);
+	pr_info("Added to list.\n");
 
-	return 0;
+	return lenovo_wmi_capdata01_setup(priv);
 }
 
 static void lenovo_wmi_capdata01_remove(struct wmi_device *wdev)
@@ -115,6 +127,11 @@ static void lenovo_wmi_capdata01_remove(struct wmi_device *wdev)
 	guard(mutex)(&cd01_list_mutex);
 	list_del(&priv->list);
 }
+
+static const struct wmi_device_id lenovo_wmi_capdata01_id_table[] = {
+	{ LENOVO_CAPABILITY_DATA_01_GUID, NULL },
+	{}
+};
 
 static struct wmi_driver lenovo_wmi_capdata01_driver = {
 	.driver = { .name = "lenovo_wmi_capdata01" },
