@@ -48,8 +48,15 @@ properties:
 
 patternProperties:
   '^p2a-control@[0-9a-f]+$':
-    description: See Documentation/devicetree/bindings/misc/aspeed-p2a-ctrl.txt
     type: object
+    additionalProperties: true
+    properties:
+      compatible:
+        contains:
+          enum:
+            - aspeed,ast2500-scu-ic
+            - aspeed,ast2600-scu-ic0
+            - aspeed,ast2600-scu-ic1
 
   '^pinctrl(@[0-9a-f]+)?$':
     type: object
