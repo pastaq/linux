@@ -261,6 +261,25 @@ err:
 	return ret;
 }
 
+static u64 bch2_copygc_dev_wait_amount(struct bch_dev *ca)
+{
+	struct bch_dev_usage_full usage_full = bch2_dev_usage_full_read(ca);
+	struct bch_dev_usage usage;
+
+	for (unsigned i = 0; i < BCH_DATA_NR; i++)
+		usage.buckets[i] = usage_full.d[i].buckets;
+
+	s64 fragmented_allowed = ((__dev_buckets_available(ca, usage, BCH_WATERMARK_stripe) *
+				   ca->mi.bucket_size) >> 1);
+	s64 fragmented = 0;
+
+	for (unsigned i = 0; i < BCH_DATA_NR; i++)
+		if (data_type_movable(i))
+			fragmented += usage_full.d[i].fragmented;
+
+	return max(0LL, fragmented_allowed - fragmented);
+}
+
 /*
  * Copygc runs when the amount of fragmented data is above some arbitrary
  * threshold:
@@ -275,27 +294,14 @@ err:
  * often and continually reduce the amount of fragmented space as the device
  * fills up. So, we increase the threshold by half the current free space.
  */
-unsigned long bch2_copygc_wait_amount(struct bch_fs *c)
+u64 bch2_copygc_wait_amount(struct bch_fs *c)
 {
-	s64 wait = S64_MAX, fragmented_allowed, fragmented;
+	u64 wait = U64_MAX;
 
-	for_each_rw_member(c, ca) {
-		struct bch_dev_usage_full usage_full = bch2_dev_usage_full_read(ca);
-		struct bch_dev_usage usage;
-
-		for (unsigned i = 0; i < BCH_DATA_NR; i++)
-			usage.buckets[i] = usage_full.d[i].buckets;
-
-		fragmented_allowed = ((__dev_buckets_available(ca, usage, BCH_WATERMARK_stripe) *
-				       ca->mi.bucket_size) >> 1);
-		fragmented = 0;
-
-		for (unsigned i = 0; i < BCH_DATA_NR; i++)
-			if (data_type_movable(i))
-				fragmented += usage_full.d[i].fragmented;
-
-		wait = min(wait, max(0LL, fragmented_allowed - fragmented));
-	}
+	rcu_read_lock();
+	for_each_rw_member_rcu(c, ca)
+		wait = min(wait, bch2_copygc_dev_wait_amount(ca));
+	rcu_read_unlock();
 
 	return wait;
 }
@@ -318,14 +324,22 @@ void bch2_copygc_wait_to_text(struct printbuf *out, struct bch_fs *c)
 					c->copygc_wait_at) << 9);
 	prt_newline(out);
 
-	prt_printf(out, "Currently calculated wait:\t");
-	prt_human_readable_u64(out, bch2_copygc_wait_amount(c));
-	prt_newline(out);
+	bch2_printbuf_make_room(out, 4096);
 
 	rcu_read_lock();
+	out->atomic++;
+
+	prt_printf(out, "Currently calculated wait:\n");
+	for_each_rw_member_rcu(c, ca) {
+		prt_printf(out, "  %s:\t", ca->name);
+		prt_human_readable_u64(out, bch2_copygc_dev_wait_amount(ca));
+		prt_newline(out);
+	}
+
 	struct task_struct *t = rcu_dereference(c->copygc_thread);
 	if (t)
 		get_task_struct(t);
+	--out->atomic;
 	rcu_read_unlock();
 
 	if (t) {
@@ -340,19 +354,13 @@ static int bch2_copygc_thread(void *arg)
 	struct moving_context ctxt;
 	struct bch_move_stats move_stats;
 	struct io_clock *clock = &c->io_clock[WRITE];
-	struct buckets_in_flight *buckets;
+	struct buckets_in_flight buckets = {};
 	u64 last, wait;
-	int ret = 0;
 
-	buckets = kzalloc(sizeof(struct buckets_in_flight), GFP_KERNEL);
-	if (!buckets)
-		return -ENOMEM;
-	ret = rhashtable_init(&buckets->table, &bch_move_bucket_params);
+	int ret = rhashtable_init(&buckets.table, &bch_move_bucket_params);
 	bch_err_msg(c, ret, "allocating copygc buckets in flight");
-	if (ret) {
-		kfree(buckets);
+	if (ret)
 		return ret;
-	}
 
 	set_freezable();
 
@@ -375,13 +383,13 @@ static int bch2_copygc_thread(void *arg)
 		cond_resched();
 
 		if (!c->opts.copygc_enabled) {
-			move_buckets_wait(&ctxt, buckets, true);
+			move_buckets_wait(&ctxt, &buckets, true);
 			kthread_wait_freezable(c->opts.copygc_enabled ||
 					       kthread_should_stop());
 		}
 
 		if (unlikely(freezing(current))) {
-			move_buckets_wait(&ctxt, buckets, true);
+			move_buckets_wait(&ctxt, &buckets, true);
 			__refrigerator(false);
 			continue;
 		}
@@ -392,7 +400,7 @@ static int bch2_copygc_thread(void *arg)
 		if (wait > clock->max_slop) {
 			c->copygc_wait_at = last;
 			c->copygc_wait = last + wait;
-			move_buckets_wait(&ctxt, buckets, true);
+			move_buckets_wait(&ctxt, &buckets, true);
 			trace_and_count(c, copygc_wait, c, wait, last + wait);
 			bch2_kthread_io_clock_wait(clock, last + wait,
 					MAX_SCHEDULE_TIMEOUT);
@@ -402,7 +410,7 @@ static int bch2_copygc_thread(void *arg)
 		c->copygc_wait = 0;
 
 		c->copygc_running = true;
-		ret = bch2_copygc(&ctxt, buckets, &did_work);
+		ret = bch2_copygc(&ctxt, &buckets, &did_work);
 		c->copygc_running = false;
 
 		wake_up(&c->copygc_running_wq);
@@ -413,16 +421,14 @@ static int bch2_copygc_thread(void *arg)
 			if (min_member_capacity == U64_MAX)
 				min_member_capacity = 128 * 2048;
 
-			move_buckets_wait(&ctxt, buckets, true);
+			move_buckets_wait(&ctxt, &buckets, true);
 			bch2_kthread_io_clock_wait(clock, last + (min_member_capacity >> 6),
 					MAX_SCHEDULE_TIMEOUT);
 		}
 	}
 
-	move_buckets_wait(&ctxt, buckets, true);
-
-	rhashtable_destroy(&buckets->table);
-	kfree(buckets);
+	move_buckets_wait(&ctxt, &buckets, true);
+	rhashtable_destroy(&buckets.table);
 	bch2_moving_ctxt_exit(&ctxt);
 	bch2_move_stats_exit(&move_stats, c);
 
