@@ -1,0 +1,14 @@
+
+config THRUSTMASTER_FFW_HID
+	tristate "ThrustMaster devices support"
+	depends on USB_HID
+	help
+	  Say Y here if you have a ThustMaster Force Feedback Racing Wheel
+
+config THRUSTMASTER_FFW_USB
+       tristate "ThrustMaster devices support"
+       depends on USB_HID
+       help
+         Say Y here if you have an Xbox branded ThustMaster Force Feedback
+         Racing Wheel.
+

@@ -1209,23 +1209,6 @@ config HID_THINGM
 	merged into the generic hid led driver. Config symbol HID_THINGM
 	just selects HID_LED and will be removed soon.
 
-config HID_THRUSTMASTER
-	tristate "ThrustMaster devices support"
-	depends on USB_HID
-	help
-	  Say Y here if you have a THRUSTMASTER FireStore Dual Power 2,
-	  a THRUSTMASTER Ferrari GT Rumble Wheel or Thrustmaster FFB
-	  Wheel (T150RS, T300RS, T300 Ferrari Alcantara Edition, T500RS).
-
-config THRUSTMASTER_FF
-	bool "ThrustMaster devices force feedback support"
-	depends on HID_THRUSTMASTER
-	select INPUT_FF_MEMLESS
-	help
-	  Say Y here if you have a THRUSTMASTER FireStore Dual Power 2 or 3,
-	  a THRUSTMASTER Dual Trigger 3-in-1 or a THRUSTMASTER Ferrari GT
-	  Rumble Force or Force Feedback Wheel.
-
 config HID_UDRAW_PS3
 	tristate "THQ PS3 uDraw tablet"
 	help
@@ -1428,6 +1411,8 @@ source "drivers/hid/amd-sfh-hid/Kconfig"
 source "drivers/hid/surface-hid/Kconfig"
 
 source "drivers/hid/intel-thc-hid/Kconfig"
+
+source "drivers/hid/thrustmaster-ffw-hid/Kconfig"
 
 endif # HID
 

@@ -131,7 +131,6 @@ obj-$(CONFIG_HID_STEAM)		+= hid-steam.o
 obj-$(CONFIG_HID_STEELSERIES)	+= hid-steelseries.o
 obj-$(CONFIG_HID_SUNPLUS)	+= hid-sunplus.o
 obj-$(CONFIG_HID_GREENASIA)	+= hid-gaff.o
-obj-$(CONFIG_HID_THRUSTMASTER)	+= hid-tmff.o hid-thrustmaster.o
 obj-$(CONFIG_HID_TIVO)		+= hid-tivo.o
 obj-$(CONFIG_HID_TOPSEED)	+= hid-topseed.o
 obj-$(CONFIG_HID_TOPRE)	+= hid-topre.o
@@ -175,3 +174,5 @@ obj-$(CONFIG_AMD_SFH_HID)       += amd-sfh-hid/
 obj-$(CONFIG_SURFACE_HID_CORE)  += surface-hid/
 
 obj-$(CONFIG_INTEL_THC_HID)     += intel-thc-hid/
+
+obj-$(CONFIG_THRUSTMASTER_FFW_HID)  += thrustmaster-ffw-hid/
