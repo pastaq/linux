@@ -84,7 +84,7 @@
 /* Handle ACPI lock mechanism */
 #define ACPI_LOCK_DELAY_MS 500
 
-int ayn_pwm_curve_registers[10] = {
+static const int ayn_pwm_curve_registers[10] = {
 	AYN_SENSOR_PWM_FAN_SPEED_1_REG,
 	AYN_SENSOR_PWM_FAN_SPEED_2_REG,
 	AYN_SENSOR_PWM_FAN_SPEED_3_REG,
@@ -97,7 +97,7 @@ int ayn_pwm_curve_registers[10] = {
 	AYN_SENSOR_PWM_FAN_TEMP_5_REG,
 };
 
-struct ayn_device {
+static struct ayn_device {
 	struct led_classdev *led_cdev;
 	u32 ayn_lock; /* ACPI EC Lock */
 	u8 rgb_effect;
@@ -311,27 +311,22 @@ static int ayn_pwm_fan_read(struct device *dev, enum hwmon_sensor_types type,
 			/* EC uses 0 for manual, 1 for automatic, 2 for user
 			 * fan curve. Reflect hwmon usage instead.
 			 */
-			if (*val == 1) {
-				*val = 2;
-				return 0;
+			
+			switch (*val) {
+			case AYN_PWM_FAN_MODE_MANUAL:
+				*val = HWMON_PWM_FAN_MODE_MANUAL;
+				break;
+			case AYN_PWM_FAN_MODE_AUTO:
+				*val = HWMON_PWM_FAN_MODE_AUTO;
+				break;
+			case AYN_PWM_FAN_MODE_EC_CURVE:
+				*val = HWMON_PWM_FAN_MODE_EC_CURVE;
+				break;
+			default:
+				return  -EINVAL;
+
 			}
-
-			if (*val == 2) {
-				*val = 3;
-				return 0;
-			}
-
-			/* Return 0 when fan at max, otherwise 1 for manual. */
-			ret = read_from_ec(AYN_SENSOR_PWM_FAN_SET_REG, 1, val);
-			if (ret)
-				return ret;
-
-			if (*val == 128)
-				*val = 0;
-			else
-				*val = 1;
-
-			return ret;
+			return 0;
 		case hwmon_pwm_input:
 			ret = read_from_ec(AYN_SENSOR_PWM_FAN_SET_REG, 1, val);
 			if (ret)
@@ -426,18 +421,19 @@ static ssize_t pwm_curve_store(struct device *dev,
 	int ret, val;
 	u8 reg;
 
-	ret = kstrtoint(buf, 0, &val);
+	ret = kstrtoint(buf, 10, &val);
 	if (ret)
 		return ret;
 
 	if (i < 5) {
 		if (val < 0 || val > 255)
 			return -EINVAL;
-		val = val >> 1; /* Max EC value is 128, scale from 255 */
-	} else
-		if (val < 0 || val > 100)
+		val = val >> 1; /* Max PWM EC value is 128, scale from 255 */
+	} else {
+		if (val < 0 || val > 100000)
 			return -EINVAL;
-
+		val = val / 1000L; /* Scale from millidegrees celcius */
+	}
 	reg = ayn_pwm_curve_registers[i];
 
 	ret = write_to_ec(reg, val);
@@ -471,7 +467,9 @@ static ssize_t pwm_curve_show(struct device *dev, struct device_attribute *attr,
 		return ret;
 
 	if (i < 5)
-		val = val << 1; /* Max EC value is 128, scale to 255 */
+		val = val << 1; /* Max PWM EC value is 128, scale to 255 */
+	else
+		val = val * 1000L; /* Scale temps to millidegrees celcius */
 
 	return sysfs_emit(buf, "%ld\n", val);
 }
