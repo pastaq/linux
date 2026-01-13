@@ -61,6 +61,9 @@
  * Later changes can be tracked in SCM.
  */
 
+#include "linux/array_size.h"
+#include "linux/dev_printk.h"
+#include "linux/usb.h"
 #include <linux/bits.h>
 #include <linux/kernel.h>
 #include <linux/input.h>
@@ -122,6 +125,49 @@ MODULE_PARM_DESC(sticks_to_null, "Do not map sticks at all for unknown pads");
 static bool auto_poweroff = true;
 module_param(auto_poweroff, bool, S_IWUSR | S_IRUGO);
 MODULE_PARM_DESC(auto_poweroff, "Power off wireless controllers on suspend");
+
+/* Xbox One ThrustMaster wheels. These devices attach through the generic
+ * XPAD_XBOXONE_VENDOR_PROTOCOL macro, but need a special init sequence
+ * to switch to usbhid to enable full force feedback mode. After the switch,
+ * xpad driver will unload. */
+static const struct tmffw_usb_device {
+	u16 idProduct;
+} tmffw_device[] = {
+	{ 0xb664 }, // Thrustmaster TX
+	{ 0xb67e }, // Thrustmaster TMX
+	{ 0xb691 }, // Thrustmaster TS-XW
+	{ 0xb69c }, // Thrustmaster T128
+};
+
+#define USB_VENDOR_ID_THRUSTMASTER	0x044f
+
+static const struct usb_ctrlrequest tmffw_cr = {
+	.bRequestType = 0x41,
+	.bRequest = 83,
+	.wValue = 0, // Filled by PID match
+	.wIndex = 0,
+	.wLength = 0
+};
+
+struct tmffw_usb {
+	struct usb_ctrlrequest *change_request;
+	struct usb_device *usb_dev;
+};
+
+struct tmffw_usb_init_data {
+	char const *const name;
+	uint16_t wValue;
+};
+
+/* ThrusMaster Wheels use the same firmware and can imitate each other's PID if they
+ * get into a bad state. Use the product name which doesn't change.
+ */
+static const struct tmffw_usb_init_data tmffw_init_data[] = {
+	{ "Thrustmaster T128X GIP Racing Wheel", 0x000b },
+	{ "Thrustmaster TMX GIP Racing Wheel", 0x0007 },
+	{ "Thrustmaster TS-XW Racer GIP Wheel", 0x000a },
+	{ "Thrustmaster TX GIP Racing Wheel", 0x0004 },
+};
 
 static const struct xpad_device {
 	u16 idVendor;
@@ -796,6 +842,105 @@ struct usb_xpad {
 	bool delay_init;		/* init packets should be delayed */
 	bool delayed_init_done;
 };
+
+static void tmffw_usb_change_handler(struct urb *urb)
+{
+	struct usb_device *udev = urb->dev;
+
+	// The USB device disconnects before answering the host, ignore.
+	if (urb->status == 0 || urb->status == -EPROTO ||
+	    urb->status == -EPIPE || urb->status == -ESHUTDOWN)
+		dev_info(&udev->dev, "Initialized Thrustmaster Wheel mode change\n");
+	else
+		dev_err(&udev->dev, "URB to change wheel mode failed with error %d\n",
+			urb->status);
+}
+
+/*
+ * Function called by USB when a USB Thrustmaster FFB wheel is connected to the host.
+ * This function tries to allocate the tmffw data structure and sends a
+ * USB_CONTROL_REQUEST to the wheel to change the device's mode to USBHID.
+ */
+static int tmffw_usb_probe(struct usb_interface *intf, const struct usb_device_id *id)
+{
+	struct tmffw_usb *tmffw = NULL;
+	struct usb_device *device;
+	struct urb *urb;
+	int i, ret = 0;
+
+	tmffw = devm_kzalloc(&intf->dev, sizeof(struct tmffw_usb),
+				GFP_KERNEL);
+	if (!tmffw) {
+		ret = -ENOMEM;
+		goto err_return;
+	}
+
+	device = interface_to_usbdev(intf);
+	if (!device) {
+		ret = -ENODEV;
+		goto err_return;
+	}
+
+	tmffw->usb_dev = device;
+	dev_set_drvdata(&intf->dev, &tmffw);
+
+	urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!urb) {
+		ret = -ENOMEM;
+		goto err_return;
+	}
+
+	tmffw->change_request = kmemdup(&tmffw_cr, sizeof(struct usb_ctrlrequest), GFP_KERNEL);
+	if (!tmffw->change_request) {
+		ret = -ENOMEM;
+		goto err_free_usb;
+	}
+
+	dev_info(&intf->dev, "Device product to match: %04x, %04x, %s\n", id->idVendor, id->idProduct, device->product);
+	for (i = 0; i < ARRAY_SIZE(tmffw_init_data); i++) {
+		if (!strcmp(tmffw_init_data[i].name, device->product)) {
+			dev_info(&intf->dev, "Match, %s\n", tmffw_init_data[i].name);
+			tmffw->change_request->wValue = cpu_to_le16(tmffw_init_data[i].wValue);
+			break;
+		}
+		dev_info(&intf->dev, "Not a match: %s\n", tmffw_init_data[i].name);
+	}
+
+	if (!tmffw->change_request->wValue) {
+		ret = -ENODEV;
+		goto err_free_usb;
+	}
+
+	dev_info(&intf->dev, "PID %x switch_value: %x\n", id->idProduct,
+		 tmffw->change_request->wValue);
+
+	usb_fill_control_urb(urb, tmffw->usb_dev,
+			     usb_sndctrlpipe(tmffw->usb_dev, 0),
+			     (char *)tmffw->change_request, NULL, 0,
+			     tmffw_usb_change_handler, &intf->dev);
+
+	ret = usb_submit_urb(urb, GFP_KERNEL);
+
+err_free_usb:
+	usb_free_urb(urb);
+err_return:
+	return ret;
+}
+
+static int is_tmffw(struct usb_interface *intf) {
+	struct usb_device *udev = interface_to_usbdev(intf);
+	u16 idProduct = le16_to_cpu(udev->descriptor.idProduct);
+	u16 idVendor = le16_to_cpu(udev->descriptor.idVendor);
+	int i;
+
+	if (idVendor == USB_VENDOR_ID_THRUSTMASTER) {
+		for (i = 0; i < ARRAY_SIZE(tmffw_device); i++)
+			if (idProduct == tmffw_device[i].idProduct)
+				return 1;
+	}
+
+	return 0;
+}
 
 static int xpad_init_input(struct usb_xpad *xpad);
 static void xpad_deinit_input(struct usb_xpad *xpad);
@@ -2066,6 +2211,14 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 	if (intf->cur_altsetting->desc.bNumEndpoints != 2)
 		return -ENODEV;
 
+	/* Xbox One ThrustMaster wheels attach through the generic
+	 * XPAD_XBOXONE_VENDOR_PROTOCOL macro. They need a special init sequence
+	 * to switch to usbhid to enable their full force feedback mode. After the
+	 * switch the device disconnects and the xpad driver will unload.
+	 * */
+	if (is_tmffw(intf))
+		return tmffw_usb_probe(intf, id);
+
 	for (i = 0; xpad_device[i].idVendor; i++) {
 		if ((le16_to_cpu(udev->descriptor.idVendor) == xpad_device[i].idVendor) &&
 		    (le16_to_cpu(udev->descriptor.idProduct) == xpad_device[i].idProduct))
@@ -2237,7 +2390,16 @@ err_free_mem:
 
 static void xpad_disconnect(struct usb_interface *intf)
 {
-	struct usb_xpad *xpad = usb_get_intfdata(intf);
+	struct usb_xpad *xpad;
+
+	/* ThrustMaster Force Feedback Racing Wheels will disconnect before drvdata
+	 * is set or the usb_xpad device is fully init. All memory is devm alloc so
+	 * there is nothing to do.
+	 */
+	if (is_tmffw(intf))
+		return;
+
+	xpad = usb_get_intfdata(intf);
 
 	if (xpad->xtype == XTYPE_XBOX360W)
 		xpad360w_stop_input(xpad);
