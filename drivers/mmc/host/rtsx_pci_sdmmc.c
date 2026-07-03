@@ -120,6 +120,22 @@ static const struct dmi_system_id rtsx_pci_sdmmc_dmi_quirks[] = {
 			DMI_MATCH(DMI_BOARD_NAME, "MS-1T52"),
 		},
 	},
+	{
+		/* MSI Claw A8 BZ2EM */
+		.driver_data = (void *)QUIRK_NO_AGGRESSIVE_PM,
+		.matches = {
+			DMI_MATCH(DMI_BOARD_VENDOR, "Micro-Star International Co., Ltd."),
+			DMI_MATCH(DMI_BOARD_NAME, "MS-1T8K"),
+		},
+	},
+	{
+		/* MSI Claw 8 EX AI+ CG3EM */
+		.driver_data = (void *)QUIRK_NO_AGGRESSIVE_PM,
+		.matches = {
+			DMI_MATCH(DMI_BOARD_VENDOR, "Micro-Star International Co., Ltd."),
+			DMI_MATCH(DMI_BOARD_NAME, "MS-1T91"),
+		},
+	},
 	{},
 };
 
@@ -147,7 +163,6 @@ struct realtek_pci_sdmmc {
 };
 
 static int sdmmc_init_sd_express(struct mmc_host *mmc, struct mmc_ios *ios);
-static int sd_power_on(struct realtek_pci_sdmmc *host, unsigned char power_mode);
 
 static inline struct device *sdmmc_dev(struct realtek_pci_sdmmc *host)
 {
@@ -922,15 +937,6 @@ static void sd_request(struct work_struct *work)
 
 	rtsx_pci_start_run(pcr);
 
-	if (host->prev_power_state == MMC_POWER_OFF) {
-		err = sd_power_on(host, MMC_POWER_ON);
-		if (err) {
-			cmd->error = err;
-			mutex_unlock(&pcr->pcr_mutex);
-			goto finish;
-		}
-	}
-
 	rtsx_pci_switch_clock(pcr, host->clock, host->ssc_depth,
 			host->initial_mode, host->double_clk, host->vpclk);
 	rtsx_pci_write_register(pcr, CARD_SELECT, 0x07, SD_MOD_SEL);
@@ -1291,79 +1297,6 @@ static int sdmmc_get_cd(struct mmc_host *mmc)
 	return cd;
 }
 
-static int sd_wait_voltage_stable_1(struct realtek_pci_sdmmc *host)
-{
-	struct rtsx_pcr *pcr = host->pcr;
-	int err;
-	u8 stat;
-
-	/* Reference to Signal Voltage Switch Sequence in SD spec.
-	 * Wait for a period of time so that the card can drive SD_CMD and
-	 * SD_DAT[3:0] to low after sending back CMD11 response.
-	 */
-	mdelay(1);
-
-	/* SD_CMD, SD_DAT[3:0] should be driven to low by card;
-	 * If either one of SD_CMD,SD_DAT[3:0] is not low,
-	 * abort the voltage switch sequence;
-	 */
-	err = rtsx_pci_read_register(pcr, SD_BUS_STAT, &stat);
-	if (err < 0)
-		return err;
-
-	if (stat & (SD_CMD_STATUS | SD_DAT3_STATUS | SD_DAT2_STATUS |
-				SD_DAT1_STATUS | SD_DAT0_STATUS))
-		return -EINVAL;
-
-	/* Stop toggle SD clock */
-	err = rtsx_pci_write_register(pcr, SD_BUS_STAT,
-			0xFF, SD_CLK_FORCE_STOP);
-	if (err < 0)
-		return err;
-
-	return 0;
-}
-
-static int sd_wait_voltage_stable_2(struct realtek_pci_sdmmc *host)
-{
-	struct rtsx_pcr *pcr = host->pcr;
-	int err;
-	u8 stat, mask, val;
-
-	/* Wait 1.8V output of voltage regulator in card stable */
-	msleep(50);
-
-	/* Toggle SD clock again */
-	err = rtsx_pci_write_register(pcr, SD_BUS_STAT, 0xFF, SD_CLK_TOGGLE_EN);
-	if (err < 0)
-		return err;
-
-	/* Wait for a period of time so that the card can drive
-	 * SD_DAT[3:0] to high at 1.8V
-	 */
-	msleep(20);
-
-	/* SD_CMD, SD_DAT[3:0] should be pulled high by host */
-	err = rtsx_pci_read_register(pcr, SD_BUS_STAT, &stat);
-	if (err < 0)
-		return err;
-
-	mask = SD_CMD_STATUS | SD_DAT3_STATUS | SD_DAT2_STATUS |
-		SD_DAT1_STATUS | SD_DAT0_STATUS;
-	val = SD_CMD_STATUS | SD_DAT3_STATUS | SD_DAT2_STATUS |
-		SD_DAT1_STATUS | SD_DAT0_STATUS;
-	if ((stat & mask) != val) {
-		dev_dbg(sdmmc_dev(host),
-			"%s: SD_BUS_STAT = 0x%x\n", __func__, stat);
-		rtsx_pci_write_register(pcr, SD_BUS_STAT,
-				SD_CLK_TOGGLE_EN | SD_CLK_FORCE_STOP, 0);
-		rtsx_pci_write_register(pcr, CARD_CLK_EN, 0xFF, 0);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
 static int sdmmc_switch_voltage(struct mmc_host *mmc, struct mmc_ios *ios)
 {
 	struct realtek_pci_sdmmc *host = mmc_priv(mmc);
@@ -1391,7 +1324,9 @@ static int sdmmc_switch_voltage(struct mmc_host *mmc, struct mmc_ios *ios)
 		voltage = OUTPUT_1V8;
 
 	if (voltage == OUTPUT_1V8) {
-		err = sd_wait_voltage_stable_1(host);
+		/* Stop toggle SD clock */
+		err = rtsx_pci_write_register(pcr, SD_BUS_STAT,
+				0xFF, SD_CLK_FORCE_STOP);
 		if (err < 0)
 			goto out;
 	}
@@ -1400,16 +1335,11 @@ static int sdmmc_switch_voltage(struct mmc_host *mmc, struct mmc_ios *ios)
 	if (err < 0)
 		goto out;
 
-	if (voltage == OUTPUT_1V8) {
-		err = sd_wait_voltage_stable_2(host);
-		if (err < 0)
-			goto out;
-	}
-
 out:
 	/* Stop toggle SD clock in idle */
-	err = rtsx_pci_write_register(pcr, SD_BUS_STAT,
-			SD_CLK_TOGGLE_EN | SD_CLK_FORCE_STOP, 0);
+	if (err < 0)
+		rtsx_pci_write_register(pcr, SD_BUS_STAT,
+				SD_CLK_TOGGLE_EN | SD_CLK_FORCE_STOP, 0);
 
 	mutex_unlock(&pcr->pcr_mutex);
 
@@ -1556,6 +1486,10 @@ static int sdmmc_init_sd_express(struct mmc_host *mmc, struct mmc_ios *ios)
 		RTS5261_MCU_BUS_SEL_MASK | RTS5261_MCU_CLOCK_SEL_MASK
 		| RTS5261_DRIVER_ENABLE_FW,
 		RTS5261_MCU_CLOCK_SEL_16M | RTS5261_DRIVER_ENABLE_FW);
+
+	/* Release the D0 hold so the function can delink for the NVMe handoff. */
+	rtsx_pci_sd_express_handoff(pcr);
+
 	host->eject = true;
 	return 0;
 }
@@ -1615,6 +1549,14 @@ static void realtek_init_host(struct realtek_pci_sdmmc *host)
 		MMC_CAP_UHS_SDR12 | MMC_CAP_UHS_SDR25;
 	if (pcr->rtd3_en && !(quirks & QUIRK_NO_AGGRESSIVE_PM))
 		mmc->caps = mmc->caps | MMC_CAP_AGGRESSIVE_PM;
+
+	/* These devices skip aggressive PM, so the function must stay in D0
+	 * rather than power-cycle a present card on runtime suspend.  Arm the
+	 * gate here; it is cleared in rtsx_pci_sdmmc_drv_remove() so it never
+	 * outlives this host.
+	 */
+	rtsx_pci_set_sd_pm_keepalive(pcr, !!(quirks & QUIRK_NO_AGGRESSIVE_PM));
+
 	mmc->caps2 = MMC_CAP2_NO_PRESCAN_POWERUP | MMC_CAP2_FULL_PWR_CYCLE |
 		MMC_CAP2_NO_SDIO;
 	mmc->max_current_330 = 400;
@@ -1636,16 +1578,6 @@ static void rtsx_pci_sdmmc_card_event(struct platform_device *pdev)
 
 	host->cookie = -1;
 	mmc_detect_change(host->mmc, 0);
-}
-
-static void rtsx_pci_sdmmc_power_off(struct platform_device *pdev)
-{
-	struct realtek_pci_sdmmc *host = platform_get_drvdata(pdev);
-
-	if (!host)
-		return;
-
-	host->prev_power_state = MMC_POWER_OFF;
 }
 
 static int rtsx_pci_sdmmc_drv_probe(struct platform_device *pdev)
@@ -1680,7 +1612,6 @@ static int rtsx_pci_sdmmc_drv_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, host);
 	pcr->slots[RTSX_SD_CARD].p_dev = pdev;
 	pcr->slots[RTSX_SD_CARD].card_event = rtsx_pci_sdmmc_card_event;
-	pcr->slots[RTSX_SD_CARD].power_off = rtsx_pci_sdmmc_power_off;
 
 	mutex_init(&host->host_mutex);
 
@@ -1695,6 +1626,7 @@ static int rtsx_pci_sdmmc_drv_probe(struct platform_device *pdev)
 
 	ret = mmc_add_host(mmc);
 	if (ret) {
+		rtsx_pci_set_sd_pm_keepalive(pcr, false);
 		pm_runtime_dont_use_autosuspend(&pdev->dev);
 		pm_runtime_disable(&pdev->dev);
 		return ret;
@@ -1710,9 +1642,10 @@ static void rtsx_pci_sdmmc_drv_remove(struct platform_device *pdev)
 	struct mmc_host *mmc;
 
 	pcr = host->pcr;
+	/* Drop the runtime-suspend gate so it never outlives this host. */
+	rtsx_pci_set_sd_pm_keepalive(pcr, false);
 	pcr->slots[RTSX_SD_CARD].p_dev = NULL;
 	pcr->slots[RTSX_SD_CARD].card_event = NULL;
-	pcr->slots[RTSX_SD_CARD].power_off = NULL;
 	mmc = host->mmc;
 
 	cancel_work_sync(&host->work);
